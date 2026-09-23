@@ -1,0 +1,13 @@
+.{
+    .name = .beancli,
+    .version = "0.1.0",
+    .fingerprint = 0x11604ab8c674e35e,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{},
+    .paths = .{
+        "beancli.zig",
+        "build.zig",
+        "build.zig.zon",
+        "README.md",
+    },
+}
