@@ -225,3 +225,6 @@ test "classify" {
     try t.expect(try classify(.{}, command) == .command);
     try t.expectError(error.UnsupportedFieldType, classify(.{}, invalid_command));
 }
+
+test "Schema.build" {}
+test "Schema.find_index" {}
