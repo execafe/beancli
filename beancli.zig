@@ -151,17 +151,16 @@ const Schema = struct {
 
         // for help and diagnostics
         short: ?u8,
-        long: []const u8,
-        long_snake: []const u8,
-        long_kebab: []const u8,
+        long: ?[]const u8,
+        long_snake: ?[]const u8,
+        long_kebab: ?[]const u8,
         default_label: ?[]const u8,
         value_label: []const u8,
         type_label: []const u8,
         choices: []const []const u8,
 
-        set_default: ?*const fn(*Schema) void,
-        assign: *const fn(*Schema, ?[]const u8) ValueError!void,
-        command: *const Schema,
+        set_default: ?*const fn(*anyopaque) void,
+        command: ?*const Schema,
     };
 
     name: []const u8, // program / command name
@@ -169,15 +168,60 @@ const Schema = struct {
 
     root_schema: ?*const Schema,
 
-    slots: []const ?usize,
+    required_slots: []const usize,
+    optional_slots: []const usize,
     shorts: []const u8,
     has_command: bool,
-    commands: []const ?usize,
+    has_slot: bool,
+    commands: []const usize,
     rest_index: ?usize,
 
     entries: []const Entry,
 };
-
+fn is_string(comptime T: type) bool {
+    if (T == []const u8) return true;
+    const info = @typeInfo(T);
+    if (info != .pointer or info.pointer.size != .one) return false;
+    const child = @typeInfo(info.pointer.child);
+    return child == .array and child.array.child == u8;
+}
+fn to_kebab(comptime string: []const u8) *const [string.len] u8{
+    var buf: [string.len]u8 = string[0..string.len].*;
+    std.mem.replaceScalar(u8, &buf, '_', '-');
+    const out = buf;
+    return &out;
+}
+fn to_snake(comptime string: []const u8) *const [string.len] u8{
+    var buf: [string.len]u8 = string[0..string.len].*;
+    std.mem.replaceScalar(u8, &buf, '-', '_');
+    const out = buf;
+    return &out;
+}
+fn to_long_flag(comptime string: []const u8) *const [string.len + 2] u8{
+    var buf: [string.len + 2]u8 = undefined;
+    buf[0] = '-'; buf[1] = '-';
+    @memcpy(buf[2..], string);
+    const out = buf;
+    return &out;
+}
+fn str_eql_kebab(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |cha, chb| {
+        const chacha = if (cha == '_') '-' else cha;
+        const chbchb = if (chb == '_') '-' else chb;
+        if (chacha != chbchb) return false;
+    }
+    return true;
+}
+fn create_set_default_function(comptime Args: type, comptime field: Field) ?*const fn(*anyopaque) void {
+    const default = field.defaultValue() orelse return null;
+    return struct {
+        fn set(args_ptr: *anyopaque) void {
+            const args: *Args = @ptrCast(@alignCast(args_ptr));
+            @field(args, field.name) = default;
+        }
+    }.set;
+}
 fn build_schema(comptime Args: type, comptime root_schema: *const Schema, comptime is_root: bool, comptime fallback_name: ?[]const u8) Schema {
     const argsinfo = @typeInfo(Args);
     if (argsinfo != .@"struct") compileError("Args must be a struct.\n", .{});
@@ -201,121 +245,171 @@ fn build_schema(comptime Args: type, comptime root_schema: *const Schema, compti
             }
         }
     }
+    inline for (.{"name", "doc"}) |decl| {
+        if (@hasDecl(Args, decl) and !is_string(@TypeOf(@field(Args, decl)))) compileError(
+            \\`{s}.{s}` must be of type []const u8, got `{s}`.
+            ,.{ @typeName(Args), decl, @typeName(@TypeOf(@field(Args, decl))) }
+        );
+    }
 
     var schema: Schema = undefined;
 
     schema.name = if (@hasDecl(Args, "name")) @field(Args, "name")
-        else if (fallback_name) |f| f
-        else "";
+    else if (fallback_name) |f| f
+    else "";
     schema.doc = if (@hasDecl(Args, "doc")) @field(Args, "doc") else "";
 
     if (!is_root) schema.root_schema = root_schema
     else schema.root_schema = null;
 
-
+    schema.has_slot = false;
     schema.has_command = false;
     schema.rest_index = null;
-    var temp_slots: [N]?usize = [_]?usize{null} ** N;
+
+    var temp_req_slots: [N]usize = undefined;
+    var temp_req_slots_len: usize = 0;
+    var temp_opt_slots: [N]usize = undefined;
+    var temp_opt_slots_len: usize = 0;
     var temp_shorts: [N]u8 = [_]u8{' '} ** N;
-    var temp_commands: [N]?usize = [_]?usize{null} ** N;
+    var temp_commands: [N]usize = undefined;
+    var temp_commands_len: usize = 0;
+
     var temp_entries: [N]Schema.Entry = undefined;
 
     inline for (fields, 0..) |field, field_index| {
+        if (field.is_comptime) compileError(
+            \\Field `{s}` invalid: comptime fields not supported.
+            ,.{field.name}
+        );
         var entry: Schema.Entry = undefined;
         const field_meta = meta_for(meta, field.name);
         const fieldinfo = @typeInfo(field.type);
         _ = fieldinfo;
 
+        for (field.name, 0..) |c, i| {
+            if (i == 0 and c == '-') compileError(
+                \\Field `{s}` invalid: field name cannot start with '-'.
+                ,.{field.name}
+            );
+            if (c == '=' or !std.ascii.isPrint(c) or std.ascii.isWhitespace(c)) compileError(
+                \\Field `{s}` invalid: field name cannot contain `=`, whitespaces, or control characters.
+                ,.{
+                    field.name,
+                }
+            );
+        }
+
         entry.name = field.name;
-        entry.name_kebab = comptime blk: {
-            var buf: [field.name.len]u8 = field.name[0..field.name.len].*;
-            std.mem.replaceScalar(u8, &buf, '_', '-');
-            const out = buf;
-            break :blk &out;
-        };
-        entry.name_snake = comptime blk: {
-            var buf: [field.name.len]u8 = field.name[0..field.name.len].*;
-            std.mem.replaceScalar(u8, &buf, '-', '_');
-            const out = buf;
-            break :blk &out;
-        };
+        entry.name_snake = comptime to_snake(field.name);
+        entry.name_kebab = comptime to_kebab(field.name);
+
+        // because we can do dashes in field names of struct by using @"" syntax
+        // flag_name: bool and @"flag-name": bool should be considered duplicates
+        for (temp_entries[0..field_index]) |prev| {
+            if (str_eql_kebab(prev.name, entry.name)) compileError(
+                \\Field `{s}` collides with field `{s}`: Both are `--{s}`.
+                ,.{
+                    entry.name, prev.name, prev.name_kebab
+                }
+            );
+        }
+
         entry.doc = field_meta.doc;
         entry.kind = classify(meta, field) catch |err| switch(err) {
             error.BoolCannotBePositional => compileError(
                 \\Field `{s}` invalid: Boolean fields cannot be positional.
-                    ,.{
-                        field.name,
+                ,.{
+                    field.name,
                 }
             ),
             error.PositionalFieldNotScalar => compileError(
                 \\Field `{s}` unsupported meta `.mode = .positional`: Positional fields must be a scalar type.
-                    ,.{
-                        field.name,
+                ,.{
+                    field.name,
                 }
             ),
             error.CounterFieldNotInt => compileError(
                 \\Field `{s}` unsupported type `{s}`: Counter fields must be an integer type.
-                    ,.{
-                        field.name,
-                        @typeName(field.type),
+                ,.{
+                    field.name,
+                    @typeName(field.type),
                 }
             ),
             error.RepeatedFieldNotSlice => compileError(
                 \\Field `{s}` unsupported type `{s}`: Repeated fields must be a slice `[]T` or `[]const T` type.
-                    ,.{
-                        field.name,
-                        @typeName(field.type),
+                ,.{
+                    field.name,
+                    @typeName(field.type),
                 }
             ),
             error.RepeatedFieldSliceChildNotNonOptionalScalar => compileError(
                 \\Field `{s}` unsupported type `{s}`: Repeated fields' slice child's type must be non-optional.
-                    ,.{
-                        field.name,
-                        @typeName(field.type),
+                ,.{
+                    field.name,
+                    @typeName(field.type),
                 }
             ),
             error.RestFieldNotSliceOfStrings => compileError(
                 \\Field `{s}` unsupported type `{s}`: Rest field can only be of type []const []const u8.
-                    ,.{
-                        field.name,
-                        @typeName(field.type),
+                ,.{
+                    field.name,
+                    @typeName(field.type),
                 }
             ),
             error.UnsupportedFieldType => compileError(
                 \\Field `{s}` unsupported type `{s}`: Unknown field type.
-                    ,.{
-                        field.name,
-                        @typeName(field.type),
+                ,.{
+                    field.name,
+                    @typeName(field.type),
                 }
             ),
         };
 
+        entry.command = null;
         switch(entry.kind) {
             .rest => {
                 if (schema.rest_index != null) compileError(
                     \\Invalid field `{s}`: Only one rest field can exist per level.
-                        ,.{
-                            entry.name,
-                }) else if (schema.has_command) compileError(
+                    ,.{entry.name}
+                ) else if (schema.has_command) compileError(
                     \\Invalid field `{s}`: A rest field cannot exist when there are subcommands.
-                        ,.{
-                            entry.name,
-                }) else schema.rest_index = field_index;
+                    ,.{entry.name}
+                ) else schema.rest_index = field_index;
             },
             .command => {
                 if (schema.rest_index != null) compileError(
                     \\Invalid field `{s}`: Commands cannot exist when there's a rest field.
-                        ,.{
-                            entry.name,
-                }) else {
-                    schema.has_command = true;
-                    temp_commands[field_index] = field_index;
+                    ,.{entry.name}
+                ) else if (schema.has_slot) compileError(
+                    \\Invalid field `{s}`: Commands cannot exist when there are positional slots.
+                    ,.{entry.name}
+                ) else {
+                    temp_commands[temp_commands_len] = field_index;
+                    temp_commands_len += 1;
+
                     const CommandArgs = @typeInfo(field.type).optional.child;
-                    entry.command = get_schema(CommandArgs, root_schema, field.name);
+                    entry.command = get_schema(CommandArgs, root_schema, entry.name_kebab);
+
+                    schema.has_command = true;
                 }
             },
             .slot => {
-                temp_slots[field_index] = field_index;
+                if (schema.has_command) compileError(
+                    \\Invalid field `{s}`: Positional fields cannot exist when there are commands.
+                    ,.{entry.name}
+                );
+                if (field.defaultValue() == null) {
+                    if (temp_opt_slots_len > 0) compileError(
+                        \\Invalid field `{s}`: Required positional slot `{s}` comes after optional positional slot `{s}`.
+                        ,.{entry.name, entry.name, temp_entries[temp_opt_slots[0].?].name}
+                    );
+                    temp_req_slots[temp_req_slots_len] = field_index;
+                    temp_req_slots_len += 1;
+                } else {
+                    temp_opt_slots[temp_opt_slots_len] = field_index;
+                    temp_opt_slots_len += 1;
+                }
+                schema.has_slot = true;
             },
             else => {},
         }
@@ -338,49 +432,51 @@ fn build_schema(comptime Args: type, comptime root_schema: *const Schema, compti
         };
 
         if (field.defaultValue()) |default_value| {
+            if (entry.kind == .command and default_value != null) compileError(
+                \\Command `{s}` invalid: commands must default to `null`.
+                ,.{entry.name},
+            );
             entry.required = false;
             const default_label = comptime std.fmt.comptimePrint("{any}", .{default_value});
             entry.default_label = default_label;
         } else {
+            if (entry.kind == .command) compileError(
+                \\Command `{s}` invalid: commands must default to `null`.
+                ,.{entry.name},
+            );
             entry.required = true;
             entry.default_label = null;
         }
 
-        if (field_meta.short) |s| {
-            if (std.mem.findScalar(u8, &temp_shorts, s) != null) compileError(
-                \\Invalid meta for field `{s}`: Short `{u}` duplicated.
-                    ,.{
-                        field.name,
-                        s,
-                }
+        if (field_meta.short) |c| {
+            if (!std.ascii.isAlphanumeric(c)) compileError(
+                \\Invalid meta for field `{s}`: Short must be alphanumeric, got `{u}`.
+                ,.{field.name, c}
             );
-            entry.short = s;
-            temp_shorts[field_index] = s;
+            switch (entry.kind) {
+                .command, .rest => compileError(
+                    \\Invalid meta for field `{s}`: `{s}` fields cannot have a short.
+                    ,.{field.name, @tagName(entry.kind)}
+                ),
+                .flag, .toggle, .counter, .repeated, .value, .slot => {},
+            }
+            if (std.mem.findScalar(u8, &temp_shorts, c) != null) compileError(
+                \\Invalid meta for field `{s}`: Short `{u}` duplicated.
+                ,.{field.name, c}
+            );
+            entry.short = c;
+            temp_shorts[field_index] = c;
         } else entry.short = null;
 
-        entry.long = comptime blk: {
-            var buf: [entry.name.len + 2]u8 = undefined;
-            buf[0] = '-'; buf[1] = '-';
-            @memcpy(buf[2..], entry.name);
-            const out = buf;
-            break :blk &out;
-        };
-
-        entry.long_snake = comptime blk: {
-            var buf: [entry.name_snake.len + 2]u8 = undefined;
-            buf[0] = '-'; buf[1] = '-';
-            @memcpy(buf[2..], entry.name_snake);
-            const out = buf;
-            break :blk &out;
-        };
-
-        entry.long_kebab = comptime blk: {
-            var buf: [entry.name_kebab.len + 2]u8 = undefined;
-            buf[0] = '-'; buf[1] = '-';
-            @memcpy(buf[2..], entry.name_kebab);
-            const out = buf;
-            break :blk &out;
-        };
+        if (entry.kind == .command or entry.kind == .rest) {
+            entry.long       = null;
+            entry.long_snake = null;
+            entry.long_kebab = null;
+        } else {
+            entry.long       = comptime to_long_flag(entry.name);
+            entry.long_snake = comptime to_long_flag(entry.name_snake);
+            entry.long_kebab = comptime to_long_flag(entry.name_kebab);
+        }
 
         entry.value_label = comptime blk: {
             var buf: [entry.name_snake.len]u8 = undefined;
@@ -399,26 +495,41 @@ fn build_schema(comptime Args: type, comptime root_schema: *const Schema, compti
 
         entry.choices = comptime blk: {
             const E = enum_child(field.type) orelse break :blk &[_][]const u8{};
-            const enumfields = @typeInfo(E).@"enum".fields;
+            const enuminfo = @typeInfo(E).@"enum";
+            if (!enuminfo.is_exhaustive) compileError(
+                \\Field `{s}` unsupported type `{s}`: Enum fields must be exhaustive.
+                ,.{field.name,@typeName(E)},
+            );
+            const enumfields = enuminfo.fields;
+            for (enumfields, 0..) |a, i| {
+                for(enumfields[0..i]) |b| {
+                    const kebab_enum_name = to_kebab(b.name);
+                    if (str_eql_kebab(a.name, b.name)) compileError(
+                        \\Enum field `{s}.{s}` collides with `{s}.{s}`: Both can be set as `--{s}={s}`.
+                        ,.{field.name, a.name, field.name, b.name, entry.name_kebab, kebab_enum_name}
+                    );
+                }
+            }
             var buf: [enumfields.len][]const u8 = undefined;
             for (enumfields, 0..) |f, i| buf[i] = f.name;
             const out = buf;
             break :blk &out;
         };
 
-        // set_default: ?*const fn(*Self) void,
+        entry.set_default = create_set_default_function(Args, field);
         // assign: *const fn(*Self, ?[]const u8) ValueError!void,
-        // command: ?*Self,
 
         temp_entries[field_index] = entry;
     }
 
-    const final_slots = temp_slots;
+    const final_req_slots = temp_req_slots;
+    const final_opt_slots = temp_opt_slots;
     const final_shorts = temp_shorts;
     const final_commands = temp_commands;
     const final_entries = temp_entries;
 
-    schema.slots = &final_slots;
+    schema.required_slots = &final_req_slots;
+    schema.optional_slots = &final_opt_slots;
     schema.shorts = &final_shorts;
     schema.commands = &final_commands;
     schema.entries = &final_entries;
@@ -439,23 +550,13 @@ pub const ValueError = error {
     InvalidCharacter,
 };
 fn parse_enum(comptime T: type, value: []const u8) ValueError!T {
-    if (@typeInfo(T) != .@"enum") @compileError("parse_enum can only be used with enum type");
     const maybe_match = std.meta.stringToEnum(T, value);
     if (maybe_match) |m| return m;
 
-    // dashed value support
-    // match against @"dashed-value"
-    // or against dashed_value
-    const fields = @typeInfo(T).@"enum".fields;
-    inline for (fields) |tag| {
-        if (tag.name.len == value.len) {
-            var matched = true;
-            for (tag.name, value) |a,b| {
-                if (!matched) break;
-                matched = a == b or (a == '_' and b == '-');
-            }
-            if (matched) return @enumFromInt(tag.value);
-        }
+    const choices = @typeInfo(T).@"enum".fields;
+    inline for (choices) |choice| {
+        const matched = str_eql_kebab(choice.name, value);
+        if (matched) return @enumFromInt(choice.value);
     }
 
     return error.InvalidValue;
@@ -480,64 +581,82 @@ fn parse_scalar(comptime T: type, value: []const u8) ValueError!T {
     };
 }
 const TokenKind = enum {
-    init,
-    flag,
-    long,
-    short,
-    barrier,
+    ident,
     value,
-    positional,
-    command,
+    equal,
+    dash,
+    double_dash,
 };
 const Token = struct {
     kind: TokenKind,
     raw: []const u8,
     arg_index: usize,
+    subindex: usize,
 };
 const ParseError = error {
+    Unimplemented,
+    EmptyArgs,
     MissingValue,
     SyntaxError,
 } || ValueError;
-const Diagnostic = struct {
-    error_type: ParseError,
-    arg_index: usize,
-    subindex: usize,
-    error_message: []const u8,
-};
+pub const Diagnostic = struct {
+    error_type: ?ParseError = null,
+    offending_token: ?Token = null,
+    // suggestion: ?[]const u8,
 
-pub fn parse(comptime Args: type, argv: []const []const u8) !void {
-    const schema = comptime get_schema(Args, null, null);
-    const print = std.debug.print;
-
-    print("schema\n", .{});
-    print("name: {s}\n", .{schema.name});
-    print("doc: {s}\n", .{schema.doc});
-    print("shorts: {s}\n", .{schema.shorts});
-    if (schema.rest_index) |i| print("rest_index: {d}\n", .{i});
-
-    inline for (schema.entries) |entry| {
-        print("entry: {s}\n", .{entry.name});
-        print("    entry kind: {any}\n", .{entry.kind});
-
-        print("    entry kebab: {s}\n", .{entry.name_kebab});
-        print("    entry snake: {s}\n", .{entry.name_snake});
-        if (entry.short) |s| print("    entry short: {u}\n", .{s});
-        print("    entry long: {s}\n", .{entry.long});
-        print("    entry long_snake: {s}\n", .{entry.long_snake});
-        print("    entry long_kebab: {s}\n", .{entry.long_kebab});
-        if (entry.default_label) |s| print("    entry default value: {s}\n", .{s});
-        print("    entry value_label: {s}\n", .{entry.value_label});
-        print("    entry type_label: {s}\n", .{entry.type_label});
-        if (entry.choices.len > 0) {
-            print("    entry choices:\n", .{});
-            for (entry.choices) |choice| print("        choice: {s}\n", .{choice});
-        }
-
-        if (entry.kind == .command) {
-            print("    COMMAND WOOHOO: {}", .{entry.command});
-        }
+    pub fn fill(diagnostic: ?*Diagnostic, error_type: ParseError, offending_token: ?Token) void {
+        if (diagnostic) |d| {
+            d.error_type = error_type;
+            d.offending_token = offending_token;
+        } else {}
     }
-    _ = argv;
+};
+const Tokens = struct {
+    argv: []const []const u8,
+    curr_index: usize = 0,
+    curr_subindex: usize = 0,
+
+    curr_token: ?Token = null,
+    parse_error: ?ParseError = null,
+
+    pub fn init(argv: []const []const u8, diagnostic: ?*Diagnostic) ?Tokens {
+        if (argv.len <= 0) {
+            Diagnostic.fill(diagnostic, ParseError.EmptyArgs, null);
+            return null;
+        }
+        return .{ .argv = argv };
+    }
+
+    fn advance_token(self: *Tokens) !Token {
+        _ = self;
+        return error.Unimplemented;
+    }
+
+    pub fn next(self: *Tokens, diagnostic: ?*Diagnostic) ?Token {
+        _ = diagnostic;
+        const len = self.argv.len;
+        const last_arg = self.argv[len - 1];
+        if (self.curr_index >= len - 1 and self.curr_subindex >= last_arg.len - 1) return null;
+
+        const curr = self.curr_token;
+        if (curr == null) {}
+
+        return null;
+    }
+};
+pub fn parse(comptime Args: type, argv: []const []const u8, diagnostic: ?*Diagnostic) Args {
+    const schema = comptime get_schema(Args, null, null);
+    _ = schema;
+    const args: Args = undefined;
+    // const print = std.debug.print;
+
+    const prog_name = if (argv.len > 0) std.fs.path.basename(argv[0]) else "";
+    _ = prog_name;
+
+    const tokens = Tokens.init(argv[1..], diagnostic);
+    _ = tokens;
+
+    return args;
 }
 
 const cli = @This();
