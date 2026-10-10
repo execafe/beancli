@@ -10,8 +10,10 @@ x file *args:
     zig run {{file}} -- {{args}}
 
 c file:
-    zig build-exe {{file}}
+    mkdir -p zig-out/
+    zig build-exe {{file}} -femit-bin=zig-out/{{file_stem(file)}}
 
 d file *args:
-    zig build-exe {{file}}
-    gf2 --args {{file_stem(file)}} {{args}} &
+    mkdir -p zig-out/
+    zig build-exe {{file}} -femit-bin=zig-out/{{file_stem(file)}}
+    gf2 --args zig-out/{{file_stem(file)}} {{args}} &
