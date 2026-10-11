@@ -683,7 +683,7 @@ fn parse_scalar(comptime T: type, value: []const u8) ValueError!T {
         else => unreachable,
     };
 }
-const ParseError = error {
+pub const ParseError = error {
     Unimplemented,
 
     EmptyArgs,
@@ -852,6 +852,7 @@ fn parse_level(
                     try set_entry(entry, allocator, args, argv, &i, null, seen_count, diagnostic);
                     if (needs_value) continue :args_loop; // took the next arg inside set_entry
                 }
+                continue;
             }
 
             // command: everything after it belongs to the command's schema

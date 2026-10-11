@@ -20,6 +20,7 @@ beancli is a CLI argument parser for Zig where the struct declaration is the who
 - [x] Short flag clusters `-fvp8080`
 - [x] Repeated options `--file 1` `--file 2`
 - [x] Error diagnostics
+- [ ] Richer diagnostics / better error messages
 - [ ] Help text
 - [ ] Did-you-mean suggestions
 - [ ] Environment variables
