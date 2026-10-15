@@ -8,11 +8,19 @@ const test_enum = enum {
     world,
 };
 
+const Test = struct {
+    files: []const []const u8,
+};
+
 const Run = struct {
     verbose: bool,
+    input: []const u8,
+    output: []const u8 = "out",
 
     pub const meta = .{
-        // .verbose = .{ .short = 'v' },
+        .verbose = .{ .short = 'v' },
+        .input   = .{ .mode  = .positional },
+        .output   = .{ .mode  = .positional },
     };
 };
 
@@ -28,15 +36,17 @@ const Args = struct {
     // output: []const u8,
     // input: []const u8,
     // rest: []const []const u8,
+    // print_help: bool,
     run: ?Run,
-    test_subcommand: ?struct {},
+    @"test": ?Test,
     // test_subcommand2: ?struct {} = null,
     // @"test-subcommand": ?struct {},
 
     pub const name = "scratch";
-    pub const doc = "hello world!";
+    pub const doc = "Scratch app for beancli!";
     pub const meta = .{
         .port = .{
+            .doc = "Port number to use.",
             .short = 'p',
         },
         .mode = .{
@@ -45,7 +55,11 @@ const Args = struct {
         .verbose = .{
             .short = 'v',
         },
-        // .input = .{.mode = .repeat},
+        // .print_help = .{
+        //     .short = 'h',
+        //     .mode = .help,
+        // },
+        // .input = .{.mode = .positional},
         // .input2 = .{.mode = .positional,},
         // .input3 = .{.mode = .positional,},
         // .output = .{.mode = .positional,},
@@ -62,12 +76,15 @@ pub fn main(init: std.process.Init) !void {
     var stderr_writer: std.Io.File.Writer = .initStreaming(.stderr(), init.io, &err_buffer);
     const err_writer = &stderr_writer.interface;
     defer stderr_writer.flush() catch {};
-    _ = writer;
 
     var info: cli.Info = undefined;
     const args = cli.parse(Args, arena, init.minimal.args, &info) catch |err| {
+        if (err == cli.ParseError.HelpRequested) {
+            try info.print_help(writer);
+            return;
+        }
         try info.print_error(err_writer);
-        return err;
+        return;
     };
     const fields = @typeInfo(@TypeOf(args)).@"struct".fields;
     inline for (fields) |f| {

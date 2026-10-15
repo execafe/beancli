@@ -69,7 +69,7 @@ fn is_scalar(comptime T: type) bool {
     };
 }
 const FieldMode = enum {
-    default, count, repeat, positional
+    default, count, repeat, positional, help
 };
 pub const Meta = struct {
     short: ?u8      = null,
@@ -99,10 +99,16 @@ const ClassifyError = error {
     RepeatedFieldSliceChildNotNonOptionalScalar,
     RestFieldNotSliceOfStrings,
     UnsupportedFieldType,
+    HelpFieldNotBool,
 };
 fn classify(comptime meta: anytype, comptime field: Field) ClassifyError!Kind {
     const M = comptime meta_for(meta, field.name);
     const T = field.type;
+
+    if (M.mode == .help) {
+        if (T != bool) return ClassifyError.HelpFieldNotBool;
+        return .flag;
+    }
 
     if (slice_child(T)) |t| {
         if (M.mode == .repeat) {
@@ -171,6 +177,17 @@ fn str_eql_kebab(a: []const u8, b: []const u8) bool {
     }
     return true;
 }
+fn create_default_label(comptime T: type, comptime value: T) ?[]const u8 {
+    if (T == []const u8) return std.fmt.comptimePrint("\"{s}\"", .{value});
+    const typeinfo = @typeInfo(T);
+    return switch(typeinfo) {
+        .optional    => |o| if (value) |v| create_default_label(o.child, v) else null,
+        .@"enum"     => @tagName(value),
+        .bool        => if (value) "true" else "false",
+        .int, .float => std.fmt.comptimePrint("{d}", .{value}),
+        else         => null,
+    };
+}
 
 const SetDefaultFn = *const fn (args: *anyopaque) void;
 const AssignFn     = *const fn (args: *anyopaque, value: ?[]const u8) ParseError!void;
@@ -196,6 +213,7 @@ const Schema = struct {
         required       : bool,
 
         // for help and diagnostics
+        is_help        : bool,
         short          : ?u8,
         long           : ?[]const u8,
         long_snake     : ?[]const u8,
@@ -217,6 +235,7 @@ const Schema = struct {
 
     name           : []const u8, // program / command name
     doc            : []const u8,
+    path           : []const u8,
 
     root_schema    : ?*const Schema,
 
@@ -231,6 +250,7 @@ const Schema = struct {
     commands       : []const usize,
 
     rest_index     : ?usize,
+    help_index     : ?usize,
 
     entries        : []const Entry,
 
@@ -249,7 +269,7 @@ const Schema = struct {
                 and name[2] != '_'
             ) return null;
         const e = self.find_by_name(name[3..]) orelse return null;
-        return if (e.kind == .flag) e else null;
+        return if (e.kind == .flag and !e.is_help) e else null;
     }
     pub fn find_by_short(self: *const Schema, short: u8) ?*const Entry {
         const i = std.mem.findScalar(u8, self.shorts, short) orelse return null;
@@ -266,6 +286,11 @@ const Schema = struct {
         if (n < req_len) return &self.entries[self.required_slots[n]];
         if (n - req_len < self.optional_slots.len) return &self.entries[self.optional_slots[n - req_len]];
         return null;
+    }
+    pub fn builtin_help(self: *const Schema) bool {
+        if (self.help_index != null) return false;
+        if (self.root_schema) |r| if (r.help_index != null) return false;
+        return true;
     }
 };
 fn create_set_default_fn(comptime Args: type, comptime field: Field, comptime kind: Kind) ?SetDefaultFn {
@@ -336,7 +361,7 @@ fn create_parse_command_fn(comptime Args: type, comptime field: Field, comptime 
         }
     }.f;
 }
-fn build_schema(comptime Args: type, comptime root_schema: *const Schema, comptime is_root: bool, comptime fallback_name: ?[]const u8) Schema {
+fn build_schema(comptime Args: type, comptime root_schema: *const Schema, comptime is_root: bool, comptime fallback_name: ?[]const u8, comptime path: []const u8) Schema {
     const argsinfo = @typeInfo(Args);
     if (argsinfo != .@"struct") compileError("Args must be a struct.\n", .{});
     const fields = argsinfo.@"struct".fields;
@@ -372,6 +397,7 @@ fn build_schema(comptime Args: type, comptime root_schema: *const Schema, compti
     else if (fallback_name) |f| f
     else "";
     schema.doc = if (@hasDecl(Args, "doc")) @field(Args, "doc") else "";
+    schema.path = path;
 
     if (!is_root) schema.root_schema = root_schema
     else schema.root_schema = null;
@@ -379,6 +405,7 @@ fn build_schema(comptime Args: type, comptime root_schema: *const Schema, compti
     schema.has_slot = false;
     schema.has_command = false;
     schema.rest_index = null;
+    schema.help_index = null;
 
     var temp_req_slots: [N]usize = undefined;
     var temp_req_slots_count: usize = 0;
@@ -474,6 +501,13 @@ fn build_schema(comptime Args: type, comptime root_schema: *const Schema, compti
                     @typeName(field.type),
                 }
             ),
+            ClassifyError.HelpFieldNotBool => compileError(
+                \\Field `{s}` unsupported type `{s}`: `.mode = .help` fields must be of type `bool`.
+                ,.{
+                    field.name,
+                    @typeName(field.type),
+                }
+            ),
         };
 
         entry.command = null;
@@ -499,7 +533,8 @@ fn build_schema(comptime Args: type, comptime root_schema: *const Schema, compti
                     temp_commands_count += 1;
 
                     const CommandArgs = @typeInfo(field.type).optional.child;
-                    entry.command = get_schema(CommandArgs, root_schema, entry.name_kebab);
+                    const sub_path = if (path.len == 0) entry.name_kebab else path ++ " " ++ entry.name_kebab;
+                    entry.command = get_schema(CommandArgs, root_schema, entry.name_kebab, sub_path);
 
                     schema.has_command = true;
                 }
@@ -544,8 +579,7 @@ fn build_schema(comptime Args: type, comptime root_schema: *const Schema, compti
                 \\Command `{s}` invalid: commands must default to `null`.
                 ,.{entry.name},
             );
-            const default_label = comptime std.fmt.comptimePrint("{any}", .{default_value});
-            entry.default_label = default_label;
+            entry.default_label = comptime create_default_label(field.type, default_value);
         } else {
             // if (entry.kind == .command) compileError(
             //     \\Command `{s}` invalid: commands must default to `null`.
@@ -674,6 +708,19 @@ fn build_schema(comptime Args: type, comptime root_schema: *const Schema, compti
         entry.parse_command = create_parse_command_fn(Args, field, entry.kind, entry.command);
 
         entry.field_index = field_index;
+
+        entry.is_help = field_meta.mode == .help;
+        if (entry.is_help) {
+            if (schema.help_index) |i| compileError(
+                \\Field `{s}` invalid: `{s}` is already the help field.
+                ,.{
+                    field.name,
+                    fields[i].name,
+                }
+            );
+            schema.help_index = field_index;
+        }
+
         temp_entries[field_index] = entry;
     }
 
@@ -704,9 +751,9 @@ fn build_schema(comptime Args: type, comptime root_schema: *const Schema, compti
 
     return schema;
 }
-fn get_schema(comptime Args: type, comptime root_schema: ?*const Schema, comptime fallback_name: ?[]const u8) *const Schema {
+fn get_schema(comptime Args: type, comptime root_schema: ?*const Schema, comptime fallback_name: ?[]const u8, comptime path: []const u8) *const Schema {
     return &struct {
-        const schema: Schema = build_schema(Args, root_schema orelse &schema, root_schema == null, fallback_name);
+        const schema: Schema = build_schema(Args, root_schema orelse &schema, root_schema == null, fallback_name, path);
     }.schema;
 }
 
@@ -752,6 +799,8 @@ pub const ParseError = error {
     MissingValue,
     MissingRequired,
 
+    HelpRequested,
+
     // allocator error
     OutOfMemory,
     Unexpected
@@ -780,7 +829,6 @@ pub const Info = struct {
     schema: *const Schema,
     diagnostic: Diagnostic,
     program_name: []const u8,
-
 
     const Message = struct {
         headline: []const u8,
@@ -852,6 +900,9 @@ pub const Info = struct {
             ParseError.Unexpected           => {
                 msg.headline = "out of memory / couldn't read the arguments";
             },
+            ParseError.HelpRequested        => {
+                msg.headline = "help requested";
+            }
         }
 
         return msg;
@@ -898,6 +949,82 @@ pub const Info = struct {
         try w.print(" {s}\n", .{msg.details});
         try w.writeByte('\n');
     }
+    fn help_entry(w: *std.Io.Writer, entry: *const Schema.Entry) std.Io.Writer.Error!void {
+        var buf: [256]u8 = undefined;
+        var left: std.Io.Writer = .fixed(&buf);
+        switch(entry.kind) {
+            .command  => try left.writeAll(entry.name_kebab),
+            .slot     => {
+                try left.print("<{s}>, ", .{entry.name_kebab});
+                if (entry.short) |c| try left.print("-{c}, ", .{c});
+                try left.print("--{s} <{s}>", .{ entry.name_kebab, entry.value_label });
+            },
+            .rest     => try left.print("[{s}...]", .{entry.name_kebab}),
+            .flag,
+            .counter,
+            .value,
+            .repeated => {
+                if (entry.short) |c| try left.print("-{c}, ", .{c}) else try left.writeAll("    ");
+                if (entry.kind == .flag and !entry.is_help) {
+                    try left.print("--[no-]{s}", .{entry.name_kebab});
+                } else {
+                    try left.print("--{s}", .{entry.name_kebab});
+                }
+                if (entry.kind == .value) try left.print(" <{s}>", .{entry.value_label});
+                if (entry.kind == .repeated) try left.print(" <{s}>...", .{entry.value_label});
+                if (entry.kind == .counter) try left.writeAll("...");
+            }
+        }
+        const doc = if (entry.kind == .command and entry.doc.len == 0) entry.command.?.doc
+                    else if (entry.is_help and entry.doc.len == 0) "Print this help"
+                    else entry.doc;
+
+        try w.print("  {s:<28}  {s}", .{left.buffered(), doc});
+        if (entry.kind != .flag) if (entry.default_label) |d| try w.print(" [default: {s}]", .{d});
+        try w.writeByte('\n');
+    }
+    pub fn print_help(info: *const Info, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        const s = info.schema;
+        if (s.doc.len > 0) try w.print("{s}\n\n", .{s.doc});
+
+        // Usage line
+        try w.print("Usage: {s}", .{info.program_name});
+        if (s.path.len > 0) try w.print(" {s}", .{s.path});
+        try w.writeAll(" [OPTIONS]");
+        for (s.required_slots) |i| try w.print(" <{s}>", .{s.entries[i].name_kebab});
+        for (s.optional_slots) |i| try w.print(" [{s}]", .{s.entries[i].name_kebab});
+        if (s.rest_index) |i| try w.print(" [{s}...]", .{ s.entries[i].name_kebab });
+        if (s.has_command) try w.writeAll(" [COMMAND]");
+        try w.writeByte('\n');
+
+        // commands
+        if (s.has_command) {
+            try w.writeAll("\nCommands:\n");
+            for (s.commands) |i| try help_entry(w, &s.entries[i]);
+        }
+
+        // positional arguments
+        if (s.has_slot or s.rest_index != null) {
+            try w.writeAll("\nArguments:\n");
+            for (s.entries) |*e| if (e.kind == .slot or e.kind == .rest) try help_entry(w, e);
+        }
+
+        // options
+        try w.writeAll("\nOptions:\n");
+        for (s.entries) |*e| if (e.long != null and e.kind != .slot) try help_entry(w, e);
+        if (s.builtin_help() and s.find_by_name("help") == null) {
+            try w.print("  {s:<28}  Print this help\n", .{
+                if (s.find_by_short('h') == null) "-h, --help" else "    --help"
+            });
+        }
+
+        // global options
+        if (s.root_schema) |r| {
+            try w.writeAll("\nGlobal options:\n");
+            for (r.entries) |*e| if (e.long != null and e.kind != .slot) try help_entry(w, e);
+        }
+        try w.writeByte('\n');
+    }
 };
 fn report(info: ?*Info, error_type: ParseError, d_info: struct {
     error_at: ?Diagnostic.ErrorAt = null,
@@ -936,6 +1063,12 @@ fn set_entry(
     seen_count: []usize,
     info: ?*Info,
 ) ParseError!void {
+    if (entry.is_help) return report(
+        info,
+        ParseError.HelpRequested,
+        .{ .entry = entry },
+    );
+
     var value = inline_value;
     // negated flag check
     if (entry.kind == .flag) {
@@ -1010,6 +1143,8 @@ fn parse_level(
     info: ?*Info,
     root: ?*const Level,
 ) ParseError!void {
+    if (info) |I| I.schema = schema;
+
     for (schema.entries) |e| if (e.set_default) |set| set(args);
 
     const seen_count = try allocator.alloc(usize, schema.entries.len);
@@ -1045,6 +1180,8 @@ fn parse_level(
                     const L = l orelse continue;
                     if (L.schema.find_by_name(name)) |e| break .{L, e, false};
                     if (L.schema.find_negated(name)) |e| break .{L, e, true};
+                } else if (schema.builtin_help() and std.mem.eql(u8, arg, "--help")) {
+                    return report(info, ParseError.HelpRequested, .{ .ctx = schema });
                 } else return report(info, ParseError.UnknownOption, .{ .error_at = .{ i, start, end }, .ctx = schema });
                 const inline_value: ?[]const u8 = if (eql_sign) |e| arg[e + 1 ..] else null;
                 try set_entry(
@@ -1067,6 +1204,8 @@ fn parse_level(
                     const level: *const Level, const entry: *const Schema.Entry = for (levels) |l| {
                         const L = l orelse continue;
                         if (L.schema.find_by_short(arg[j])) |e| break .{ L, e };
+                    } else if (schema.builtin_help() and arg[j] == 'h') {
+                        return report(info, ParseError.HelpRequested, .{ .ctx = schema });
                     } else return report(info, ParseError.UnknownOption, .{ .error_at = .{ i, j, j + 1 }, .ctx = schema });
                     const tail = arg[j + 1..];
                     const needs_value = entry.takes_value and !entry.value_optional;
@@ -1174,7 +1313,7 @@ pub fn parse(comptime Args: type,
              process_args: std.process.Args,
              info: ?*Info,
 ) ParseError!Args {
-    const schema = comptime get_schema(Args, null, null);
+    const schema = comptime get_schema(Args, null, null, "");
     const argv = try process_args.toSlice(arena);
     const program_name = if (argv.len > 0) std.fs.path.basename(argv[0]) else "";
     const user_args = if (argv.len > 1) argv[1..] else &.{};
