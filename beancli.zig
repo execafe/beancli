@@ -32,7 +32,6 @@ fn compileError(comptime fmt: []const u8, comptime args: anytype) noreturn {
 const Field = std.builtin.Type.StructField;
 const Kind = enum {
     flag, // bool type, does not accept value
-    toggle, // ?bool type, accepts value
     counter, // e.g. -vvv or --verbose=3, must be integer type
     repeated, // e.g. -I src -I lib, []const T type
     value, // e.g. --port80, could be one of the following types: any integer, float, any enum, or []const u8
@@ -132,7 +131,7 @@ fn classify(comptime meta: anytype, comptime field: Field) ClassifyError!Kind {
 
     if (T == bool or T == ?bool) {
         if (M.mode == .positional) return ClassifyError.BoolCannotBePositional;
-        if (T == bool) return .flag else return .toggle;
+        return .flag;
     }
 
     return if (M.mode == .positional) .slot else .value;
@@ -172,10 +171,16 @@ fn str_eql_kebab(a: []const u8, b: []const u8) bool {
     }
     return true;
 }
+
 const SetDefaultFn = *const fn (args: *anyopaque) void;
 const AssignFn     = *const fn (args: *anyopaque, value: ?[]const u8) ParseError!void;
 const AppendFn     = *const fn (args: *anyopaque, allocator: std.mem.Allocator, cap: usize, count: usize, value: []const u8) ParseError!void;
-const CommandFn    = *const fn (args: *anyopaque, allocator: std.mem.Allocator, argv: []const []const u8, diagnostic: ?*Diagnostic) ParseError!void;
+const CommandFn    = *const fn (args: *anyopaque, allocator: std.mem.Allocator, argv: []const []const u8, info: ?*Info, root: *const Level) ParseError!void;
+const Level = struct {
+    schema: *const Schema,
+    args: *anyopaque,
+    seen_count: []usize,
+};
 const Schema = struct {
     pub const Entry = struct {
         field_index    : usize,
@@ -198,12 +203,14 @@ const Schema = struct {
         default_label  : ?[]const u8,
         value_label    : []const u8,
         type_label     : []const u8,
+        min_label      : ?[]const u8,
+        max_label      : ?[]const u8,
         choices        : []const []const u8,
 
         command        : ?*const Schema,
 
         set_default: ?SetDefaultFn,   // null = no default = required
-        assign: ?AssignFn,            // flag, toggle, counter, value, slot
+        assign: ?AssignFn,            // flag, counter, value, slot
         append: ?AppendFn,            // repeated, rest
         parse_command: ?CommandFn,    // command
     };
@@ -234,6 +241,16 @@ const Schema = struct {
         }
         return null;
     }
+    pub fn find_negated(self: *const Schema, name: []const u8) ?*const Entry {
+        if (name.len <= 3
+                or name[0]  != 'n'
+                or name[1]  != 'o'
+                or name[2]  != '-'
+                and name[2] != '_'
+            ) return null;
+        const e = self.find_by_name(name[3..]) orelse return null;
+        return if (e.kind == .flag) e else null;
+    }
     pub fn find_by_short(self: *const Schema, short: u8) ?*const Entry {
         const i = std.mem.findScalar(u8, self.shorts, short) orelse return null;
         return &self.entries[self.shorts_index[i]];
@@ -254,10 +271,11 @@ const Schema = struct {
 fn create_set_default_fn(comptime Args: type, comptime field: Field, comptime kind: Kind) ?SetDefaultFn {
     // Implicit defaults
     const value: field.type = field.defaultValue() orelse switch (kind) {
-        .flag => false,
+        .flag    => if (field.type == bool) false else null,
         .counter => 0,
-        .rest => &.{},
-        else => return null,
+        .rest    => &.{},
+        .command => null,
+        else     => return null,
     };
     return struct {
         fn f(args_ptr: *anyopaque) void {
@@ -269,7 +287,7 @@ fn create_set_default_fn(comptime Args: type, comptime field: Field, comptime ki
 fn create_assign_fn(comptime Args: type, comptime field: Field, comptime kind: Kind) ?AssignFn {
     switch (kind) {
         .repeated, .rest, .command => return null,
-        .flag, .toggle, .counter, .value, .slot => {},
+        .flag, .counter, .value, .slot => {},
     }
     return struct {
         fn f(args_ptr: *anyopaque, value: ?[]const u8) ParseError!void {
@@ -278,11 +296,7 @@ fn create_assign_fn(comptime Args: type, comptime field: Field, comptime kind: K
             const field_ptr = &@field(args, field.name);
             switch(kind) {
                 .flag => {
-                    if (value != null) return ParseError.FlagTakesNoValue;
-                    field_ptr.* = true;
-                },
-                .toggle => {
-                    field_ptr.* = if (value) |v| try parse_scalar(?bool, v) else true;
+                    field_ptr.* = if (value) |v| try parse_scalar(bool, v) else true;
                 },
                 .counter => {
                     field_ptr.* = if (value) |v| try parse_scalar(T, v) else try std.math.add(T, field_ptr.*, 1);
@@ -314,10 +328,10 @@ fn create_parse_command_fn(comptime Args: type, comptime field: Field, comptime 
     if (kind != .command) return null;
     const Sub = @typeInfo(field.type).optional.child;
     return struct {
-        fn f(args_ptr: *anyopaque, allocator: std.mem.Allocator, argv: []const []const u8, diagnostic: ?*Diagnostic) ParseError!void {
+        fn f(args_ptr: *anyopaque, allocator: std.mem.Allocator, argv: []const []const u8, info: ?*Info, root: *const Level) ParseError!void {
             const args: *Args = @ptrCast(@alignCast(args_ptr));
             var sub: Sub = undefined;
-            try parse_level(sub_schema.?, allocator, &sub, argv, diagnostic);
+            try parse_level(sub_schema.?, allocator, &sub, argv, info, root);
             @field(args, field.name) = sub;
         }
     }.f;
@@ -413,47 +427,47 @@ fn build_schema(comptime Args: type, comptime root_schema: *const Schema, compti
 
         entry.doc = field_meta.doc;
         entry.kind = classify(meta, field) catch |err| switch(err) {
-            error.BoolCannotBePositional => compileError(
+            ClassifyError.BoolCannotBePositional => compileError(
                 \\Field `{s}` invalid: Boolean fields cannot be positional.
                 ,.{
                     field.name,
                 }
             ),
-            error.PositionalFieldNotScalar => compileError(
+            ClassifyError.PositionalFieldNotScalar => compileError(
                 \\Field `{s}` unsupported meta `.mode = .positional`: Positional fields must be a scalar type.
                 ,.{
                     field.name,
                 }
             ),
-            error.CounterFieldNotInt => compileError(
+            ClassifyError.CounterFieldNotInt => compileError(
                 \\Field `{s}` unsupported type `{s}`: Counter fields must be an integer type.
                 ,.{
                     field.name,
                     @typeName(field.type),
                 }
             ),
-            error.RepeatedFieldNotSlice => compileError(
+            ClassifyError.RepeatedFieldNotSlice => compileError(
                 \\Field `{s}` unsupported type `{s}`: Repeated fields must be a slice `[]T` or `[]const T` type.
                 ,.{
                     field.name,
                     @typeName(field.type),
                 }
             ),
-            error.RepeatedFieldSliceChildNotNonOptionalScalar => compileError(
+            ClassifyError.RepeatedFieldSliceChildNotNonOptionalScalar => compileError(
                 \\Field `{s}` unsupported type `{s}`: Repeated fields' slice child's type must be non-optional.
                 ,.{
                     field.name,
                     @typeName(field.type),
                 }
             ),
-            error.RestFieldNotSliceOfStrings => compileError(
+            ClassifyError.RestFieldNotSliceOfStrings => compileError(
                 \\Field `{s}` unsupported type `{s}`: Rest field can only be of type []const []const u8.
                 ,.{
                     field.name,
                     @typeName(field.type),
                 }
             ),
-            error.UnsupportedFieldType => compileError(
+            ClassifyError.UnsupportedFieldType => compileError(
                 \\Field `{s}` unsupported type `{s}`: Unknown field type.
                 ,.{
                     field.name,
@@ -512,20 +526,17 @@ fn build_schema(comptime Args: type, comptime root_schema: *const Schema, compti
         }
 
         entry.takes_value = switch(entry.kind) {
-            .flag, .command => false,
+            .flag, .command   => false,
             .value, .slot,
             .repeated, .rest,
-            .toggle,
-            .counter        => true,
-            // else            => unreachable,
+            .counter          => true,
         };
 
         entry.value_optional = switch(entry.kind) {
-            .flag, .command   => false,
-            .counter, .toggle => true,
+            .flag, .command  => false, // no value at all
+            .counter         => true,
             .slot, .value,
-            .repeated, .rest  => false,
-            // else            => unreachable,
+            .repeated, .rest => false,
         };
 
         if (field.defaultValue()) |default_value| {
@@ -536,10 +547,10 @@ fn build_schema(comptime Args: type, comptime root_schema: *const Schema, compti
             const default_label = comptime std.fmt.comptimePrint("{any}", .{default_value});
             entry.default_label = default_label;
         } else {
-            if (entry.kind == .command) compileError(
-                \\Command `{s}` invalid: commands must default to `null`.
-                ,.{entry.name},
-            );
+            // if (entry.kind == .command) compileError(
+            //     \\Command `{s}` invalid: commands must default to `null`.
+            //     ,.{entry.name},
+            // );
             entry.default_label = null;
         }
 
@@ -556,7 +567,7 @@ fn build_schema(comptime Args: type, comptime root_schema: *const Schema, compti
                     \\Invalid meta for field `{s}`: `{s}` fields cannot have a short.
                     ,.{field.name, @tagName(entry.kind)}
                 ),
-                .flag, .toggle, .counter, .repeated, .value, .slot => {},
+                .flag, .counter, .repeated, .value, .slot => {},
             }
             if (std.mem.findScalar(u8, temp_shorts[0..temp_shorts_count], c) != null) compileError(
                 \\Invalid meta for field `{s}`: Short `{u}` duplicated.
@@ -578,20 +589,62 @@ fn build_schema(comptime Args: type, comptime root_schema: *const Schema, compti
             entry.long_kebab = comptime to_long_flag(entry.name_kebab);
         }
 
-        entry.value_label = comptime blk: {
-            var buf: [entry.name_snake.len]u8 = undefined;
-            _ = std.ascii.upperString(&buf, entry.name_snake);
-            const out = buf;
-            break :blk &out;
+        const typeinfo = @typeInfo(field.type);
+        entry.type_label = @typeName(field.type);
+        const valueinfo = if (entry.kind == .repeated) @typeInfo(typeinfo.pointer.child) else typeinfo;
+        entry.value_label = comptime switch (entry.kind) {
+            .flag, .command => "",
+            .rest           => "STRING",
+            .counter, .slot, .value, .repeated => val: switch (valueinfo) {
+                .optional => |info| continue :val @typeInfo(info.child),
+                .pointer  => |info| {
+                    if (info.child == u8) break :val "STRING"
+                    else continue :val @typeInfo(info.child);
+                },
+                .bool     => "true|false",
+                .int      => |info| if (info.signedness == .signed) "INT" else "UINT",
+                .float    => "FLOAT",
+                .@"enum"  => |info| {
+                    var choices: []const u8 = "";
+                    for (info.fields, 0..) |f, i| {
+                        if (i > 0) choices = choices ++ "|";
+                        choices = choices ++ f.name;
+                    }
+                    break :val choices;
+                },
+                else => @compileError("no value label for " ++ @typeName(field.type)),
+            },
         };
-
-        entry.type_label = comptime blk: {
-            const type_name = @typeName(field.type);
-            var buf: [type_name.len]u8 = undefined;
-            _ = std.ascii.upperString(&buf, type_name);
-            const out = buf;
-            break :blk &out;
-        };
+        blk: switch (typeinfo) {
+            .optional => |info| {
+                entry.type_label = @typeName(info.child);
+                const childinfo = @typeInfo(info.child);
+                continue :blk childinfo;
+            },
+            .pointer => |info| {
+                entry.type_label = @typeName(info.child);
+                if ((info.child == u8 and entry.kind != .repeated) // []const u8
+                        or (info.child == []const u8 and entry.kind == .repeated)) { // []const []const u8
+                    entry.min_label = null;
+                    entry.max_label = null;
+                    break :blk;
+                }
+                const childinfo = @typeInfo(info.child);
+                continue :blk childinfo;
+            },
+            .int => |info| {
+                entry.min_label = std.fmt.comptimePrint("{d}", .{std.math.minInt(@Int(info.signedness, info.bits))});
+                entry.max_label = std.fmt.comptimePrint("{d}", .{std.math.maxInt(@Int(info.signedness, info.bits))});
+            },
+            .float => |info| {
+                entry.min_label = std.fmt.comptimePrint("{d}", .{std.math.floatMin(std.meta.Float(info.bits))});
+                entry.max_label = std.fmt.comptimePrint("{d}", .{std.math.floatMax(std.meta.Float(info.bits))});
+            },
+            else => {
+                entry.min_label = null;
+                entry.max_label = null;
+            }
+        }
 
         entry.choices = comptime blk: {
             const E = enum_child(field.type) orelse break :blk &[_][]const u8{};
@@ -622,6 +675,17 @@ fn build_schema(comptime Args: type, comptime root_schema: *const Schema, compti
 
         entry.field_index = field_index;
         temp_entries[field_index] = entry;
+    }
+
+    // flag name check for negation
+    for (temp_entries) |a| {
+        if (a.kind != .flag) continue;
+        for (temp_entries) |b| {
+            if (b.name_kebab.len == a.name_kebab.len + 3 and std.mem.startsWith(u8, b.name_kebab, "no-") and std.mem.eql(u8, b.name_kebab[3..], a.name_kebab)) compileError(
+                \\Field `{s}` collides with `--no-{s}` (negation of flag `{s}`)
+                ,.{ b.name, a.name_kebab, a.name },
+            );
+        }
     }
 
     const final_req_slots = temp_req_slots[0..temp_req_slots_count].*;
@@ -662,7 +726,7 @@ fn parse_enum(comptime T: type, value: []const u8) ValueError!T {
         if (matched) return @enumFromInt(choice.value);
     }
 
-    return error.InvalidValue;
+    return ValueError.InvalidValue;
 }
 fn parse_scalar(comptime T: type, value: []const u8) ValueError!T {
     if (T == []const u8) return value;
@@ -672,91 +736,230 @@ fn parse_scalar(comptime T: type, value: []const u8) ValueError!T {
         else if (std.mem.eql(u8, value, "false"))
             false
         else
-            error.InvalidValue,
+            ValueError.InvalidValue,
         .int => try std.fmt.parseInt(T, value, 10),
         .float => try std.fmt.parseFloat(T, value),
         .@"enum" => try parse_enum(T, value),
-        .optional => |info| if (info.child == bool and std.mem.eql(u8, value, "null"))
-            null
-        else
-            try parse_scalar(info.child, value),
+        .optional => |info| try parse_scalar(info.child, value),
         else => unreachable,
     };
 }
 pub const ParseError = error {
-    Unimplemented,
-
-    EmptyArgs,
-    UnknownFlag,
+    UnexpectedPositional,
     FlagTakesNoValue,
+
+    UnknownOption,
     MissingValue,
     MissingRequired,
-    UnexpectedPositional,
-    SyntaxError,
 
     // allocator error
     OutOfMemory,
     Unexpected
 } || ValueError;
-const ErrorAt = struct {
-    arg_index: usize,
-    start: usize,
-    end: usize,
-};
 pub const Diagnostic = struct {
-    all_args: []const []const u8 = &.{},
+    args: []const []const u8 = &.{},
+    offset: usize = 0,
+
     error_type: ?ParseError = null,
+
     error_at: ?ErrorAt = null,
+    missing_value: bool = false,
+    value: ?[]const u8 = null,
+
+    entry: ?*const Schema.Entry = null,
+    ctx: ?*const Schema = null,
     suggestion: []const u8 = "",
 
-    pub fn print(self: *Diagnostic, writer: *std.Io.Writer) !void {
-        const full_arg = if (self.error_at) |e| self.all_args[e.arg_index] else "";
-        if (self.error_type) |err| {
-            try writer.print(
-                \\Error parsing arguments `{s}`: {s}
-                \\
-                , .{
-                    full_arg,
-                    @errorName(err),
+    pub const ErrorAt = struct {
+        usize, // arg_index -> arg = args[arg_index]
+        usize, // start
+        usize, // end       -> error_at = arg[start..end]
+    };
+};
+pub const Info = struct {
+    schema: *const Schema,
+    diagnostic: Diagnostic,
+    program_name: []const u8,
+
+
+    const Message = struct {
+        headline: []const u8,
+        details: []const u8,
+    };
+    fn message(buf: []u8, err: ParseError, d: *const Diagnostic) Message {
+        var msg: Message = .{ .headline = @errorName(err), .details = "" };
+        const arg = if (d.error_at) |e| d.args[e[0]] else "";
+        const ctx_name = if (d.ctx) |c| c.name else "";
+        switch (err) {
+            ParseError.UnknownOption        => {
+                msg.headline = std.fmt.bufPrint(buf, "unknown option `{s}`", .{arg}) catch "";
+                msg.details = std.fmt.bufPrint(buf[msg.headline.len..], "not an option of `{s}`", .{ctx_name}) catch "";
+            },
+            ParseError.UnexpectedPositional => {
+                msg.headline = std.fmt.bufPrint(buf, "unexpected argument `{s}`", .{arg}) catch "";
+                msg.details = "no more positional arguments";
+            },
+            ParseError.MissingValue         => {
+                msg.headline = std.fmt.bufPrint(buf, "`{s}` needs a value", .{arg}) catch "";
+                msg.details = std.fmt.bufPrint(buf[msg.headline.len..], "expected `<{s}>` here", .{d.entry.?.value_label}) catch "";
+            },
+            ParseError.FlagTakesNoValue     => {
+                const eql_idx = std.mem.findScalar(u8, arg, '=');
+                msg.headline = std.fmt.bufPrint(buf, "`{s}` doesn't take a value", .{arg[0..eql_idx orelse arg.len]}) catch "";
+                msg.details = std.fmt.bufPrint(buf[msg.headline.len..], "remove `{s}`", .{if (eql_idx) |i| arg[i..] else d.value orelse ""}) catch "";
+            },
+            ParseError.InvalidValue         => {
+                msg.headline = std.fmt.bufPrint(buf, "invalid value `{s}` for `{s}`", .{d.value.?, d.entry.?.long_kebab.?}) catch "";
+                if (d.entry.?.choices.len > 0) {
+                    var w: std.Io.Writer = .fixed(buf[msg.headline.len..]);
+                    w.writeAll("expected one of: ") catch {};
+                    for (d.entry.?.choices, 0..) |choice, i| {
+                        if (i > 0) w.writeAll(", ") catch {};
+                        if (i == d.entry.?.choices.len - 1) w.writeAll("or ") catch {};
+                        w.print("`{s}`", .{choice}) catch {};
+                    }
+                    msg.details = w.buffered();
                 }
-            );
-        } else return error.NoError;
+            },
+            ParseError.InvalidCharacter     => {
+                msg.headline = std.fmt.bufPrint(buf, "invalid value `{s}` for `{s}`", .{d.value.?, d.entry.?.long_kebab.?}) catch "";
+                msg.details = std.fmt.bufPrint(buf[msg.headline.len..], "expected a `{s}`", .{d.entry.?.type_label}) catch "";
+            },
+            ParseError.Overflow             => {
+                msg.headline = std.fmt.bufPrint(buf, "invalid value `{s}` for `{s}`", .{d.value.?, d.entry.?.long_kebab.?}) catch "";
+                msg.details = std.fmt.bufPrint(buf[msg.headline.len..],
+                                               "out of range for `{s}`, expected value from {s} to {s}",
+                                               .{d.entry.?.type_label, d.entry.?.min_label.?, d.entry.?.max_label.?}) catch "";
+            },
+            ParseError.MissingRequired      => {
+                switch(d.entry.?.kind) {
+                    .value,
+                    .slot,
+                    .counter  => {
+                        msg.headline = std.fmt.bufPrint(buf, "missing required `{s} <{s}>`", .{d.entry.?.long_kebab.?, d.entry.?.value_label}) catch "";
+                    },
+                    .repeated => {
+                        msg.headline = std.fmt.bufPrint(buf, "missing required `{s} <{s}> ...`", .{d.entry.?.long_kebab.?, d.entry.?.value_label}) catch "";
+                    },
+                    .flag,
+                    .command,
+                    .rest     => {
+                        // cannot be required
+                    }
+                }
+            },
+            ParseError.OutOfMemory,
+            ParseError.Unexpected           => {
+                msg.headline = "out of memory / couldn't read the arguments";
+            },
+        }
+
+        return msg;
+    }
+    pub fn print_error(info: *Info, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        const d = &info.diagnostic;
+        const err = d.error_type orelse return;
+        var buf : [256]u8 = undefined;
+        const msg = message(&buf, err, d);
+
+        try w.print("[beancli] error: {s}\n", .{msg.headline});
+
+        // echo program name + args
+        var arg_col: usize = 0;
+        var col: usize = 4 + info.program_name.len;
+        try w.print("    {s}", .{info.program_name});
+        for (d.args, 0..) |arg, idx| {
+            try w.writeByte(' ');
+            col += 1;
+            if (d.error_at) |at| {
+                if (idx == at[0]) arg_col = col;
+            }
+            try w.writeAll(arg);
+            col += arg.len;
+        }
+        try w.writeByte('\n');
+
+        const at = d.error_at orelse {
+            // MissingRequired, Unexpected, OutOfMemory ends here
+            try w.writeByte('\n');
+            return;
+        };
+
+        // underline offending arg
+        const arg = d.args[at[0]];
+        const pad = arg_col + arg[0..at[1]].len;
+        const len = @max(1, arg[at[1]..at[2]].len);
+        try w.splatByteAll(' ', pad);
+        try w.splatByteAll('^', len);
+        if (d.missing_value) {
+            try w.splatByteAll(' ', col - (pad + len) + 1);
+            try w.writeByte('^');
+        }
+        try w.print(" {s}\n", .{msg.details});
+        try w.writeByte('\n');
     }
 };
-fn report(diagnostic: ?*Diagnostic,
-          error_type: ParseError,
-          all_args: []const []const u8,
-          arg_index: ?usize,
-          start: ?usize,
-          end: ?usize
-) ParseError!void {
-    if (diagnostic) |d| {
-        d.error_type = error_type;
-        d.all_args = all_args;
-        d.error_at = if (arg_index) |i| .{
-            .arg_index = i,
-            .start = start orelse 0,
-            .end = end orelse 0
-        } else null;
+fn report(info: ?*Info, error_type: ParseError, d_info: struct {
+    error_at: ?Diagnostic.ErrorAt = null,
+    missing_value: bool = false,
+    value: ?[]const u8 = null,
+
+    entry: ?*const Schema.Entry = null,
+    ctx: ?*const Schema = null,
+    suggestion: []const u8 = "",
+}) ParseError {
+    if (info) |I| {
+        I.diagnostic.error_type    = error_type;
+        I.diagnostic.error_at      = if (d_info.error_at) |e| .{ e[0] + I.diagnostic.offset, e[1], e[2] } else null;
+        I.diagnostic.missing_value = d_info.missing_value;
+        I.diagnostic.value         = d_info.value;
+
+        I.diagnostic.entry         = d_info.entry;
+        I.diagnostic.ctx           = d_info.ctx;
+        I.diagnostic.suggestion    = d_info.suggestion;
     }
     return error_type;
 }
+
 fn set_entry(
     entry: *const Schema.Entry,
     allocator: std.mem.Allocator,
     args: *anyopaque,
     argv: []const []const u8,
-    i: *usize,
+    arg_index: *usize,
+    negated: bool,
     inline_value: ?[]const u8,
+    value_at: ?struct {
+        usize, //start
+        usize //end
+    },
     seen_count: []usize,
-    diagnostic: ?*Diagnostic,
+    info: ?*Info,
 ) ParseError!void {
     var value = inline_value;
+    // negated flag check
+    if (entry.kind == .flag) {
+        if (inline_value != null) return report(info, ParseError.FlagTakesNoValue, .{
+            .error_at = .{ arg_index.*, if (value_at) |v| v[0] else 0, if (value_at) |v| v[1] else argv[arg_index.*].len },
+            .entry = entry,
+            .value = inline_value,
+        });
+        value = if (negated) "false" else null;
+    }
+
     const needs_value = entry.takes_value and !entry.value_optional;
     if (value == null and needs_value) {
-        if (i.* + 1 >= argv.len) return report(diagnostic, error.MissingValue, argv, i.*, 0, argv[i.*].len);
-        i.* += 1;
-        value = argv[i.*];
+        if (arg_index.* + 1 >= argv.len) return report(
+            info,
+            ParseError.MissingValue,
+            .{
+                .error_at = .{ arg_index.*, 0, argv[arg_index.*].len },
+                .entry = entry,
+                .missing_value = true,
+            }
+        );
+        arg_index.* += 1;
+        value = argv[arg_index.*];
     }
     const count = seen_count[entry.field_index];
     if (entry.assign) |f| {
@@ -764,12 +967,17 @@ fn set_entry(
             args,
             value
         ) catch |err| return report(
-            diagnostic,
+            info,
             err,
-            argv,
-            i.*,
-            0,
-            argv[i.*].len
+            .{
+                .error_at = .{
+                    arg_index.*,
+                    if (value_at) |v| v[0] else 0,
+                    if (value_at) |v| v[1] else argv[arg_index.*].len
+                },
+                .entry = entry,
+                .value = value,
+            }
         );
     } else if (entry.append) |f| {
         f(
@@ -779,12 +987,17 @@ fn set_entry(
             count,
             value.?
         ) catch |err| return report(
-            diagnostic,
+            info,
             err,
-            argv,
-            i.*,
-            0,
-            argv[i.*].len
+            .{
+                .error_at = .{
+                    arg_index.*,
+                    if (value_at) |v| v[0] else 0,
+                    if (value_at) |v| v[1] else argv[arg_index.*].len
+                },
+                .entry = entry,
+                .value = value,
+            }
         );
     } else unreachable;
     seen_count[entry.field_index] = count + 1;
@@ -794,13 +1007,17 @@ fn parse_level(
     allocator: std.mem.Allocator,
     args: *anyopaque,
     argv: []const []const u8,
-    diagnostic: ?*Diagnostic,
+    info: ?*Info,
+    root: ?*const Level,
 ) ParseError!void {
     for (schema.entries) |e| if (e.set_default) |set| set(args);
 
     const seen_count = try allocator.alloc(usize, schema.entries.len);
     defer allocator.free(seen_count);
     @memset(seen_count, 0);
+
+    const here: Level = .{ .schema = schema, .args = args, .seen_count = seen_count };
+    const levels = [_]?*const Level {&here, root};
 
     var next_slot: usize = 0;
     var after_barrier = false;
@@ -823,10 +1040,22 @@ fn parse_level(
                 start = 2;
                 const eql_sign = std.mem.findScalar(u8, arg, '=');
                 end = eql_sign orelse arg.len;
-                const entry = schema.find_by_name(arg[2..end]) orelse
-                    return report(diagnostic, error.UnknownFlag, argv, i, start, end);
+                const name = arg[2..end];
+                const level: *const Level, const entry: *const Schema.Entry, const negated: bool = for (levels) |l| {
+                    const L = l orelse continue;
+                    if (L.schema.find_by_name(name)) |e| break .{L, e, false};
+                    if (L.schema.find_negated(name)) |e| break .{L, e, true};
+                } else return report(info, ParseError.UnknownOption, .{ .error_at = .{ i, start, end }, .ctx = schema });
                 const inline_value: ?[]const u8 = if (eql_sign) |e| arg[e + 1 ..] else null;
-                try set_entry(entry, allocator, args, argv, &i, inline_value, seen_count, diagnostic);
+                try set_entry(
+                    entry,
+                    allocator,
+                    level.args,
+                    argv, &i,
+                    negated,
+                    inline_value, if (eql_sign) |e| .{e, arg.len} else null,
+                    level.seen_count, info
+                );
                 continue;
             }
 
@@ -835,21 +1064,46 @@ fn parse_level(
                 start = 1;
                 var j: usize = start;
                 while (j < arg.len) : (j += 1) {
-                    const entry = schema.find_by_short(arg[j]) orelse
-                        return report(diagnostic, error.UnknownFlag, argv, i, j, j + 1);
+                    const level: *const Level, const entry: *const Schema.Entry = for (levels) |l| {
+                        const L = l orelse continue;
+                        if (L.schema.find_by_short(arg[j])) |e| break .{ L, e };
+                    } else return report(info, ParseError.UnknownOption, .{ .error_at = .{ i, j, j + 1 }, .ctx = schema });
                     const tail = arg[j + 1..];
                     const needs_value = entry.takes_value and !entry.value_optional;
-
                     if (tail.len > 0 and tail[0] == '=') {
                         const inline_value = tail[1..];
-                        try set_entry(entry, allocator, args, argv, &i, inline_value, seen_count, diagnostic);
+                        try set_entry(
+                            entry,
+                            allocator,
+                            level.args,
+                            argv, &i,
+                            false,
+                            inline_value, .{ j + 1, arg.len },
+                            level.seen_count, info
+                        );
                         continue :args_loop;
                     }
                     if (needs_value and tail.len > 0) {
-                        try set_entry(entry, allocator, args, argv, &i, tail, seen_count, diagnostic);
+                        try set_entry(
+                            entry,
+                            allocator,
+                            level.args,
+                            argv, &i,
+                            false,
+                            tail, .{ j + 1, arg.len },
+                            level.seen_count, info
+                        );
                         continue :args_loop;
                     }
-                    try set_entry(entry, allocator, args, argv, &i, null, seen_count, diagnostic);
+                    try set_entry(
+                        entry,
+                        allocator,
+                        level.args,
+                        argv, &i,
+                        false,
+                        null, null,
+                        level.seen_count, info
+                    );
                     if (needs_value) continue :args_loop; // took the next arg inside set_entry
                 }
                 continue;
@@ -857,7 +1111,10 @@ fn parse_level(
 
             // command: everything after it belongs to the command's schema
             if (schema.find_command(arg)) |entry| {
-                try entry.parse_command.?(args, allocator, argv[i + 1 ..], diagnostic);
+                if (info) |I| {
+                    I.diagnostic.offset += i + 1;
+                }
+                try entry.parse_command.?(args, allocator, argv[i + 1 ..], info, root orelse &here);
                 seen_count[entry.field_index] += 1;
                 break;
             }
@@ -865,46 +1122,69 @@ fn parse_level(
 
         // positional: free slot, then rest regardless if after barrier or not
         if (schema.slot_at(next_slot)) |entry| {
-            try set_entry(entry, allocator, args, argv, &i, arg, seen_count, diagnostic);
+            try set_entry(
+                entry,
+                allocator,
+                args,
+                argv, &i,
+                false,
+                arg, .{ 0, arg.len },
+                seen_count, info
+            );
             next_slot += 1;
         } else if (schema.rest_index) |rest_index| {
-            try set_entry(&schema.entries[rest_index], allocator, args, argv, &i, arg, seen_count, diagnostic);
+            try set_entry(
+                &schema.entries[rest_index],
+                allocator,
+                args,
+                argv, &i,
+                false,
+                arg, .{ 0, arg.len },
+                seen_count, info
+            );
         } else {
-            return report(diagnostic, error.UnexpectedPositional, argv, i, 0, arg.len);
+            return report(
+                info,
+                ParseError.UnexpectedPositional,
+                .{
+                    .error_at = .{ i, 0, arg.len },
+                    .ctx = schema,
+                    .value = arg,
+                }
+            );
         }
     }
 
-    for (schema.entries) |e| {
-        if (e.required and seen_count[e.field_index] == 0)
-            return report(diagnostic, error.MissingRequired, argv, null, null, null);
+    for (schema.entries) |*e| {
+        if (e.required and seen_count[e.field_index] == 0) {
+            return report(
+                info,
+                ParseError.MissingRequired,
+                .{
+                    .error_at = null,
+                    .ctx = schema,
+                    .entry = e,
+                }
+            );
+        }
     }
 }
-// const print = std.debug.print;
 pub fn parse(comptime Args: type,
              arena: std.mem.Allocator,
              process_args: std.process.Args,
-             diagnostic: ?*Diagnostic
+             info: ?*Info,
 ) ParseError!Args {
     const schema = comptime get_schema(Args, null, null);
     const argv = try process_args.toSlice(arena);
-    const prog_name = if (argv.len > 0) std.fs.path.basename(argv[0]) else return ParseError.EmptyArgs;
-    _ = prog_name;
-    // const user_args = if (argv.len > 1) argv[1..] else {
-    //     report(
-    //         diagnostic,
-    //         ParseError.EmptyArgs,
-    //         argv,
-    //         null,
-    //         null,
-    //         null,
-    //     ) catch {};
-    //     return ParseError.EmptyArgs;
-    // };
+    const program_name = if (argv.len > 0) std.fs.path.basename(argv[0]) else "";
     const user_args = if (argv.len > 1) argv[1..] else &.{};
-    if (diagnostic) |d| d.all_args = user_args;
-
+    if (info) |I| {
+        I.program_name = program_name;
+        I.diagnostic = .{ .args = user_args, .offset = 0 };
+        I.schema = schema;
+    }
     var args: Args = undefined;
-    try parse_level(schema, arena, &args, user_args, diagnostic);
+    try parse_level(schema, arena, &args, user_args, info, null);
     return args;
 }
 
